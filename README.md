@@ -1,5 +1,4 @@
-# watermark-attacks
-Denoising Diffusion Model Watermarks Attacks
+# Gen-Image-Detector
+Denoising Diffusion Model Generated Images Detection
 
--- attacks.py - python file containing implementations of considered watermarks attacks
 
