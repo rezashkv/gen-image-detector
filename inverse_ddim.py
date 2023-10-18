@@ -11,7 +11,7 @@ from diffusers.pipelines.stable_diffusion.safety_checker import \
 from diffusers.schedulers import DDIMScheduler, PNDMScheduler, LMSDiscreteScheduler
 
 
-# Skeleton: https://github.com/cccntu/efficient-prompt-to-prompt
+# Source: https://github.com/cccntu/efficient-prompt-to-prompt
 
 def backward_ddim(x_t, alpha_t, alpha_tm1, eps_xt):
     """ from noise to image"""
@@ -222,7 +222,7 @@ class InvertibleStableDiffusionPipeline(StableDiffusionPipeline):
         return image
 
     @torch.inference_mode()
-    def reconstruction_error(self, args, dataloader, text_embeddings):
+    def reconstruction_error(self, args, dataloader, text_embeddings, dft=False):
         errors = []
         for step, batch in enumerate(dataloader):
             img = batch["input"]
@@ -248,8 +248,16 @@ class InvertibleStableDiffusionPipeline(StableDiffusionPipeline):
 
             reconstructed_img = self.decode_image(reconstructed_latents)
 
-            # compute the l2 error between the original image and the reconstructed image
-            error = torch.norm(img - reconstructed_img)
+            # if dft compute the error in the frequency domain
+            if dft:
+                img = torch.fft.fft(img)
+                reconstructed_img = torch.fft.fft(reconstructed_img)
+
+                # compute the error only for high frequencies
+                img = img[:, :, img.shape[2] // 2:, :]
+                reconstructed_img = reconstructed_img[:, :, reconstructed_img.shape[2] // 2:, :]
+
+            error = torch.abs(img - reconstructed_img).mean(dim=(1, 2, 3))
             errors.append(error.item())
         return errors
 
@@ -307,3 +315,46 @@ class InvertibleStableDiffusionPipeline(StableDiffusionPipeline):
             latents_t = latents_t_p_1
 
         return err
+
+    @torch.inference_mode()
+    def reconstruct_image_step_t(self, image_latents, timestep, text_embeddings, noise):
+        timestep_t = torch.LongTensor([timestep]).to(image_latents.device)
+        noisy_latents = self.scheduler.add_noise(image_latents, noise, timesteps=timestep_t)
+        noise_pred = self.unet(noisy_latents, timestep_t, encoder_hidden_states=text_embeddings).sample
+        alpha_t = self.scheduler.alphas_cumprod[timestep]
+        reconstructed_latents = (noisy_latents - (1 - alpha_t) ** 0.5 * noise_pred) / (alpha_t ** 0.5)
+        reconstructed_image = self.decode_image(reconstructed_latents)
+        return reconstructed_image
+
+    @torch.inference_mode()
+    def noise_scale_error(self, args, dataloader, text_embeddings, dft=False):
+        errors = []
+        for step, batch in enumerate(dataloader):
+            img = batch["input"]
+            img = img.to("cuda")
+
+            image_latents = self.get_image_latents(img,
+                                                   rng_generator=torch.Generator(device=self.device).manual_seed(0))
+
+            noise = torch.randn(image_latents.shape).to(img.device)
+
+            reconstructed_image1 = self.reconstruct_image_step_t(image_latents, args.timestep1, text_embeddings, noise)
+            reconstructed_image2 = self.reconstruct_image_step_t(image_latents, args.timestep2, text_embeddings, noise)
+
+            # if dft compute the error in the frequency domain
+            if dft:
+                img = torch.fft.fft(img)
+                reconstructed_image1 = torch.fft.fft(reconstructed_image1)
+                reconstructed_image2 = torch.fft.fft(reconstructed_image2)
+
+                # compute the error only for high frequencies
+                img = img[:, :, img.shape[2] // 2:, :]
+                reconstructed_image1 = reconstructed_image1[:, :, reconstructed_image1.shape[2] // 2:, :]
+                reconstructed_image2 = reconstructed_image2[:, :, reconstructed_image2.shape[2] // 2:, :]
+
+            error1 = torch.abs(img - reconstructed_image1).mean(dim=(1, 2, 3))
+            error2 = torch.abs(img - reconstructed_image2).mean(dim=(1, 2, 3))
+            error = error1 / error2
+            errors.append(error.item())
+
+        return errors
