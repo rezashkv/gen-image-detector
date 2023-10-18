@@ -22,21 +22,19 @@ def parse_args():
         type=str,
         default=None,
         help=(
-            "The name of the real Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
+            "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
             " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
             " or to a folder containing files that HF Datasets can understand."
         ),
     )
-
     parser.add_argument(
-        "--generated_dataset_name",
+        "--dataset_type",
         type=str,
-        default=None,
+        default="real",
         help=(
-            "The name of the generated Dataset (from the HuggingFace hub) to train on (could be your own,"
-            "possibly private, dataset). It can also be a path pointing to a local copy of a dataset in your filesystem"
-            "or to a folder containing files that HF Datasets can understand."
+            "The type of the Dataset to train on. Could be real or generated."
         ),
+        choices=["real", "generated"]
     )
 
     parser.add_argument(
@@ -69,16 +67,7 @@ def parse_args():
             " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
         ),
     )
-    parser.add_argument(
-        "--generated_train_data_dir",
-        type=str,
-        default=None,
-        help=(
-            "A folder containing the generated training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
-        ),
-    )
+
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -262,6 +251,36 @@ def parse_args():
         help="the step for reconstruction prediction",
     )
 
+    parser.add_argument(
+        "--timestep1",
+        type=int,
+        default=200,
+        help="the step for noise scale 1",
+    )
+
+    parser.add_argument(
+        "--timestep2",
+        type=int,
+        default=300,
+        help="the step for noise scale 2",
+
+    )
+
+    parser.add_argument(
+        "--error_type",
+        type=str,
+        default="reconstruction",
+        help="the type of error to compute",
+        choices=["reconstruction", "noise_scale", "stepwise"]
+    )
+
+    parser.add_argument(
+        "--dft",
+        type=bool,
+        default=False,
+        help="whether to use discrete fourier transform for reconstruction prediction",
+    )
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -284,7 +303,7 @@ def main(args):
         import wandb
         # login using WANDB_LOGIN env variable
         wandb.login(key=os.environ.get("WANDB_LOGIN"))
-        wandb.init(project="stablediffusion-detection", config=args)
+        wandb.init(project="stablediffusion-detection", config=args, name=args.output_dir)
     else:
         raise ValueError(f"Unknown logger: {args.logger}")
 
@@ -310,21 +329,7 @@ def main(args):
     else:
         dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
 
-    if args.generated_dataset_name is not None:
-        generated_dataset = load_dataset(
-            args.generated_dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            split="train",
-        )
-    else:
-        generated_dataset = load_dataset(path=args.generated_train_data_dir,
-                                         cache_dir=args.cache_dir, split="train")
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
-
     dataset = dataset.select(range(args.num_training_samples))
-    generated_dataset = generated_dataset.select(range(args.num_training_samples))
 
     # Preprocessing the datasets and DataLoaders creation.
     transformations = transforms.Compose(
@@ -337,34 +342,15 @@ def main(args):
     )
 
     def transform_images(examples):
-        # if "image" not in examples:
-        #     images = []
-        #     for image in examples["URL"]:
-        #         try:
-        #             im = transformations(Image.open(requests.get(image, stream=True).raw).convert("RGB"))
-        #             images.append(im)
-        #         except:
-        #             logging.info(f"Image {image} could snot be downloaded.")
-        #             continue
-        #
-        # else:
         images = [transformations(image.convert("RGB")) for image in examples["image"]]
-        # if len of images is less than len of examples, clone the last image to fill the gap
-        # if len(images) < len(examples):
-        #     images += [images[-1]] * (len(examples) - len(images))
-        # images = torch.stack(images)
         return {"input": images}
 
     logging.info(f"Dataset size: {len(dataset)}")
 
     dataset.set_transform(transform_images)
-    generated_dataset.set_transform(transform_images)
 
     train_dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
-    )
-    generated_train_dataloader = torch.utils.data.DataLoader(
-        generated_dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
     )
 
     total_batch_size = args.train_batch_size * args.gradient_accumulation_steps
@@ -381,25 +367,23 @@ def main(args):
 
     prompt = ""
     text_embeddings = pipe.get_text_embedding(prompt)
+    if args.error_type == "reconstruction":
+        errors = pipe.reconstruction_error(args, train_dataloader, text_embeddings, dft=args.dft)
+    elif args.error_type == "noise_scale":
+        errors = pipe.noise_scale_error(args, train_dataloader, text_embeddings, dft=args.dft)
+    elif args.error_type == "stepwise":
+        errors = pipe.stepwise_error(args, train_dataloader, text_embeddings, dft=args.dft, reverse_process=True)
+    else:
+        raise ValueError(f"Unknown error type: {args.error_type}")
 
-    real_errors = pipe.reconstruction_error(args, train_dataloader, text_embeddings)
-
-    generated_errors = pipe.reconstruction_error(args, generated_train_dataloader, text_embeddings)
-
-    # logging.info("real_errors: ", real_errors)
-    real_errors = [[err] for err in real_errors]
-
-    # logging.info("generated_errors: ", generated_errors)
-    generated_errors = [[err] for err in generated_errors]
+    errors = [[err] for err in errors]
 
     # create a histogram of the errors in wandb
     if args.logger == "wandb":
-        real_table = wandb.Table(data=real_errors, columns=["errors"])
-        wandb.log({args.output_dir: wandb.plot.histogram(real_table, "errors",
-                                                         title="Real")})
-        generated_table = wandb.Table(data=generated_errors, columns=["errors"])
-        wandb.log({args.output_dir: wandb.plot.histogram(generated_table, "errors",
-                                                         title="Generated")})
+        table = wandb.Table(data=errors, columns=["errors"])
+        wandb.log({"Error Histogram": wandb.plot.histogram(table, "errors",
+                                                         title="Reconstruction Error Distribution")})
+        wandb.finish()
 
     elif args.logger == "tensorboard":
         raise NotImplementedError("Tensorboard logging is not implemented yet.")
