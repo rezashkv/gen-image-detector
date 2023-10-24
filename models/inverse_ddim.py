@@ -352,6 +352,9 @@ class InvertibleStableDiffusionPipeline(StableDiffusionPipeline):
                 reconstructed_image1 = reconstructed_image1[:, :, reconstructed_image1.shape[2] // 2:, :]
                 reconstructed_image2 = reconstructed_image2[:, :, reconstructed_image2.shape[2] // 2:, :]
 
+            # Technically error could be computed as the norm of the difference between the predicted noise
+            # and the actual noise, but for code readability we compute the error as the norm of the difference between
+            # the reconstructed images
             error1 = torch.abs(img - reconstructed_image1).mean(dim=(1, 2, 3))
             error2 = torch.abs(img - reconstructed_image2).mean(dim=(1, 2, 3))
             error = error1 / error2
