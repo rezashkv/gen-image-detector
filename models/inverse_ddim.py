@@ -328,36 +328,78 @@ class InvertibleStableDiffusionPipeline(StableDiffusionPipeline):
 
     @torch.inference_mode()
     def noise_scale_error(self, args, dataloader, text_embeddings, dft=False):
-        errors = []
+        errors = {}
+        for i in range(len(args.timesteps)):
+            for j in range(i + 1, len(args.timesteps)):
+                errors[(args.timesteps[i], args.timesteps[j])] = []
         for step, batch in enumerate(dataloader):
             img = batch["input"]
             img = img.to("cuda")
 
             image_latents = self.get_image_latents(img,
-                                                   rng_generator=torch.Generator(device=self.device).manual_seed(0))
+                                                   rng_generator=torch.Generator(device=self.device).manual_seed(
+                                                       0))
 
-            noise = torch.randn(image_latents.shape).to(img.device)
+            err = {}
+            for timestep in args.timesteps:
+                # compute the noise scale
+                noise = torch.randn(image_latents.shape).to(image_latents.device)
 
-            reconstructed_image1 = self.reconstruct_image_step_t(image_latents, args.timestep1, text_embeddings, noise)
-            reconstructed_image2 = self.reconstruct_image_step_t(image_latents, args.timestep2, text_embeddings, noise)
+                reconstructed_img = self.reconstruct_image_step_t(image_latents, timestep, text_embeddings, noise)
 
-            # if dft compute the error in the frequency domain
-            if dft:
-                img = torch.fft.fft(img)
-                reconstructed_image1 = torch.fft.fft(reconstructed_image1)
-                reconstructed_image2 = torch.fft.fft(reconstructed_image2)
+                # if dft compute the error in the frequency domain
+                if dft:
+                    img_dft = torch.fft.rfft(img)
+                    reconstructed_img_dft = torch.fft.rfft(reconstructed_img)
 
-                # compute the error only for high frequencies
-                img = img[:, :, img.shape[2] // 2:, :]
-                reconstructed_image1 = reconstructed_image1[:, :, reconstructed_image1.shape[2] // 2:, :]
-                reconstructed_image2 = reconstructed_image2[:, :, reconstructed_image2.shape[2] // 2:, :]
+                    # compute the error only for high frequencies
+                    img_dft = img_dft[:, :, img_dft.shape[2] // 2:, :]
+                    reconstructed_img_dft = reconstructed_img_dft[:, :, reconstructed_img_dft.shape[2] // 2:, :]
 
-            # Technically error could be computed as the norm of the difference between the predicted noise
-            # and the actual noise, but for code readability we compute the error as the norm of the difference between
-            # the reconstructed images
-            error1 = torch.abs(img - reconstructed_image1).mean(dim=(1, 2, 3))
-            error2 = torch.abs(img - reconstructed_image2).mean(dim=(1, 2, 3))
-            error = error1 / error2
-            errors.append(error.item())
+                    err[timestep] = torch.sum((img_dft - reconstructed_img_dft) ** 2, dim=(1, 2, 3)).item()
+                else:
+                    err[timestep] = torch.sum((img - reconstructed_img) ** 2, dim=(1, 2, 3)).item()
+
+            for i in range(len(args.timesteps)):
+                for j in range(i + 1, len(args.timesteps)):
+                    errors[(args.timesteps[i], args.timesteps[j])].append(
+                        err[args.timesteps[i]] / err[args.timesteps[j]])
+        return errors
+
+    @torch.inference_mode()
+    def noise_scale_error_dft_binned(self, args, dataloader, text_embeddings, n_bins=12):
+        errors = {}
+        for i in range(len(args.timesteps)):
+            for j in range(i + 1, len(args.timesteps)):
+                errors[(args.timesteps[i], args.timesteps[j])] = []
+        for step, batch in enumerate(dataloader):
+            img = batch["input"]
+            img = img.to("cuda")
+
+            image_latents = self.get_image_latents(img,
+                                                   rng_generator=torch.Generator(device=self.device).manual_seed(
+                                                       0))
+
+            err = {}
+            for timestep in args.timesteps:
+                # compute the noise scale
+                noise = torch.randn(image_latents.shape).to(image_latents.device)
+
+                reconstructed_img = self.reconstruct_image_step_t(image_latents, timestep, text_embeddings, noise)
+
+                img_dft = torch.fft.rfft(img)
+                reconstructed_img_dft = torch.fft.rfft(reconstructed_img)
+
+                # divide the img and reconstructed_img to 12 bins
+                img_dft = torch.chunk(img_dft, n_bins, dim=2)
+                reconstructed_img_dft = torch.chunk(reconstructed_img_dft, n_bins, dim=2)
+
+                err[timestep] = [torch.abs(img_dft[i] - reconstructed_img_dft[i]).mean(dim=(1, 2, 3)).item() for i in
+                                 range(n_bins)]
+
+            for i in range(len(args.timesteps)):
+                for j in range(i + 1, len(args.timesteps)):
+                    errors[(args.timesteps[i], args.timesteps[j])].append(
+                        [err[args.timesteps[i]][k] / err[args.timesteps[j]][k] for k in range(n_bins)])
 
         return errors
