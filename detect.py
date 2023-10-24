@@ -3,6 +3,7 @@ import logging
 import math
 import os
 
+import numpy as np
 import requests
 import torch
 from datasets import load_dataset
@@ -10,7 +11,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 
 from inverse_ddim import InvertibleStableDiffusionPipeline
-from diffusers import DPMSolverMultistepScheduler
+from diffusers import DPMSolverMultistepScheduler, DDIMScheduler
 from torchvision import transforms
 from diffusers.utils import is_tensorboard_available, is_wandb_available
 
@@ -252,17 +253,11 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--timestep1",
+        "--timesteps",
+        nargs="*",
         type=int,
-        default=200,
-        help="the step for noise scale 1",
-    )
-
-    parser.add_argument(
-        "--timestep2",
-        type=int,
-        default=300,
-        help="the step for noise scale 2",
+        default=[50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 950, 1000],
+        help="the step for noise scale 3",
 
     )
 
@@ -279,6 +274,13 @@ def parse_args():
         type=bool,
         default=False,
         help="whether to use discrete fourier transform for reconstruction prediction",
+    )
+
+    parser.add_argument(
+        "--n_bins",
+        type=int,
+        default=1,
+        help="the bin size for chunking the frequency domain",
     )
 
     args = parser.parse_args()
@@ -301,9 +303,17 @@ def main(args):
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
         import wandb
-        # login using WANDB_LOGIN env variable
+
+        def log_wandb_error_histogram(project, name, args, errors):
+            wandb.init(project=project, config=args, name=name)
+            errors = [[err] for err in errors]
+            print(errors)
+            table = wandb.Table(data=errors, columns=["errors"])
+            wandb.log({"Error Histogram": wandb.plot.histogram(table, "errors",
+                                                               title="Reconstruction Error Distribution")})
+            wandb.finish()
+
         wandb.login(key=os.environ.get("WANDB_LOGIN"))
-        wandb.init(project="stablediffusion-detection", config=args, name=args.output_dir)
     else:
         raise ValueError(f"Unknown logger: {args.logger}")
 
@@ -367,26 +377,39 @@ def main(args):
 
     prompt = ""
     text_embeddings = pipe.get_text_embedding(prompt)
-    if args.error_type == "reconstruction":
+    if args.error_type == "noise_scale":
+        if args.n_bins > 1:
+            errors = pipe.noise_scale_error_dft_binned(args, train_dataloader, text_embeddings, n_bins=args.n_bins)
+            for key in errors:
+                error = errors[key]
+                print(np.array(error).shape)
+                for i in range(args.n_bins):
+                    log_wandb_error_histogram(project="stablediffusion-detection",
+                                              name="{}-{}-{}-bin-{}".format(args.output_dir, key[0], key[1], i),
+                                              args=args,
+                                              errors=np.array(error)[:, i])
+
+
+        else:
+            errors = pipe.noise_scale_error(args, train_dataloader, text_embeddings, dft=args.dft)
+            for key in errors:
+                error = errors[key]
+                log_wandb_error_histogram(project="stablediffusion-detection",
+                                          name="{}-{}-{}".format(args.output_dir, key[0], key[1]), args=args,
+                                          errors=error)
+
+    elif args.error_type == "reconstruction":
         errors = pipe.reconstruction_error(args, train_dataloader, text_embeddings, dft=args.dft)
-    elif args.error_type == "noise_scale":
-        errors = pipe.noise_scale_error(args, train_dataloader, text_embeddings, dft=args.dft)
+        if args.logger == "wandb":
+            log_wandb_error_histogram(project="stablediffusion-detection", name=args.output_dir, args=args,
+                                      errors=errors)
     elif args.error_type == "stepwise":
         errors = pipe.stepwise_error(args, train_dataloader, text_embeddings, dft=args.dft, reverse_process=True)
+        if args.logger == "wandb":
+            log_wandb_error_histogram(project="stablediffusion-detection", name=args.output_dir, args=args,
+                                      errors=errors)
     else:
         raise ValueError(f"Unknown error type: {args.error_type}")
-
-    errors = [[err] for err in errors]
-
-    # create a histogram of the errors in wandb
-    if args.logger == "wandb":
-        table = wandb.Table(data=errors, columns=["errors"])
-        wandb.log({"Error Histogram": wandb.plot.histogram(table, "errors",
-                                                         title="Reconstruction Error Distribution")})
-        wandb.finish()
-
-    elif args.logger == "tensorboard":
-        raise NotImplementedError("Tensorboard logging is not implemented yet.")
 
 
 if __name__ == "__main__":
