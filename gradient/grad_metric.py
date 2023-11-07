@@ -11,7 +11,7 @@ from diffusers.pipelines.stable_diffusion.safety_checker import \
 from diffusers.schedulers import DDIMScheduler, PNDMScheduler, LMSDiscreteScheduler
 
 import pandas as pd
-
+import numpy as np
 # Source: https://github.com/cccntu/efficient-prompt-to-prompt
 
 def backward_ddim(x_t, alpha_t, alpha_tm1, eps_xt):
@@ -367,37 +367,55 @@ class InvertibleStableDiffusionPipeline(StableDiffusionPipeline):
                         err[args.timesteps[i]] / err[args.timesteps[j]])
         return errors
     
-    def grad_to_dis(grad, bins):
-    # takes a 2D image gradient (Tensor) and approximates it by a distribution over reals (Tensor)
-    grad_flat = []
-    for row in grad:
-        for el in row:
-            grad_flat.append(el)
-    df = pd.DataFrame(grad_flat, columns=['original'])
-    df['bin'] = pd.cut(df1['original'], bins=bins)
-    df = df1.groupby('bin').count()    
+    def grad_to_dist(self, grad, bins):
+     # takes a 2D image gradient (Tensor) and approximates it by a distribution over reals (Tensor)
+        grad_flat = torch.flatten(grad)
+        grad_flat = grad_flat.tolist()
+
+        df = pd.DataFrame(grad_flat, columns=['original'])
+        df['bin'] = pd.cut(df['original'], bins=bins)
+        df = df.groupby('bin', observed=False).count()    
     
-    #adding eps to avoid empty support
-    eps = 0.0000000000001
-    df['original'] = df['original'] + eps
-    df['original'] = df['original'] / df['original'].sum()
-    return torch.FloatTensor(df['original'])
+        #adding eps to avoid empty support
+        eps = 0.0000000000001
+        df['original'] = df['original'] + eps
+        df['original'] = df['original'] / df['original'].sum()
+        return torch.FloatTensor(df['original'])
     
-    def gradient_kl_div(batch_im1, batch_im2):
-    # takes im1, im2 gradients in format (1x3xHxW) and returns coordinate-wise average of KL divergence of the gradients
-    for i in range(len(batch[0])):
-        # discretizing the distribution with 0.01 precision on the interval [-1, 1] 
-        bins = [float(i) / 100 for i in range(-100, 101)]
+    def gradient_kl_div(self, batch_im1, batch_im2):
+    # takes im1, im2 gradients in format (3xHxW) and returns coordinate-wise average of KL divergence of the gradients
+        total = 0
+        for i in range(len(batch_im1)):
+            # discretizing the distribution with 0.01 precision on the interval [-1, 1] 
+            # bins = [float(i) / 100 for i in range(-100, 101)]
     
-        P = grad_to_dist(batch_im1[0][i], bins)
-        Q = grad_to_dist(batch_im2[0][i], bins)
-        # calculating the similarity, smaller means Q is closer to P
-        kl_metric = (P * (P / Q).log()).sum()
-        total += kl_metric
+            P = batch_im1[i] #self.grad_to_dist(batch_im1[0][i].cpu(), bins)
+            Q = batch_im2[i] #self.grad_to_dist(batch_im2[0][i].cpu(), bins)
+            
+            # calculating the similarity, smaller means Q is closer to P
+            kl_metric = (P * (P / Q).log()).sum()
+            total += kl_metric
     
-    return total / len(batch[0])
+        return total.item() / len(batch_im1)
     
     
+    def _compute_image_gradients(self, img):
+        # """Compute image gradients (dy/dx) for a given image."""
+        batch_size, channels, height, width = img.shape
+
+        dy = img[..., 1:, :] - img[..., :-1, :]
+        dx = img[..., :, 1:] - img[..., :, :-1]
+
+        shapey = [batch_size, channels, 1, width]
+        dy = torch.cat([dy, torch.zeros(shapey, device=img.device, dtype=img.dtype)], dim=2)
+        dy = dy.view(img.shape)
+
+        shapex = [batch_size, channels, height, 1]
+        dx = torch.cat([dx, torch.zeros(shapex, device=img.device, dtype=img.dtype)], dim=3)
+        dx = dx.view(img.shape)
+
+        return dy, dx
+
     @torch.inference_mode()
     def gradient_error(self, args, dataloader, text_embeddings):
         errors = {}
@@ -406,29 +424,48 @@ class InvertibleStableDiffusionPipeline(StableDiffusionPipeline):
                 errors[(args.timesteps[i], args.timesteps[j])] = []
         
         for step, batch in enumerate(dataloader):
+            #if step > 10: 
+            #    break
             img = batch["input"]
             img = img.to("cuda")
 
             image_latents = self.get_image_latents(img,
                                                    rng_generator=torch.Generator(device=self.device).manual_seed(
                                                        0))
+            for k in range(1):
+                gradients_x = {}
+                gradients_y = {}
+                errors_local = {}
+                for i in range(len(args.timesteps)):
+                    for j in range(i + 1, len(args.timesteps)):
+                        errors_local[(args.timesteps[i], args.timesteps[j])] = []
 
-            gradients_x = {}
-            gradients_y = {}
-            for timestep in args.timesteps:
-                # compute the noise scale
-                noise = torch.randn(image_latents.shape).to(image_latents.device)
+                for timestep in args.timesteps:
+                    # compute the noise scale
+                    noise = torch.randn(image_latents.shape).to(image_latents.device)
 
-                reconstructed_img = self.reconstruct_image_step_t(image_latents, timestep, text_embeddings, noise)
-            
-                gradients_x[timestep], gradients_y = torchmetrics.functional.image.image_gradients(reconstructed_img)
+                    reconstructed_img = self.reconstruct_image_step_t(image_latents, timestep, text_embeddings, noise)
+                 
+                    # dx, dy are 1x3xHxW tensors
+                    bins = [float(i) / 100 for i in range(-100, 101)]
+                    dx, dy = self._compute_image_gradients(reconstructed_img)
+                    gradients_x[timestep] = [self.grad_to_dist(grad.cpu(), bins) for grad in dx[0]]
+                    gradients_y[timestep] = [self.grad_to_dist(grad.cpu(), bins) for grad in dy[0]]
+
+                for i in range(len(args.timesteps)):
+                    for j in range(i + 1, len(args.timesteps)):
+                        errors_local[(args.timesteps[i], args.timesteps[j])].append(
+                            0.5 * (self.gradient_kl_div(gradients_x[args.timesteps[i]], gradients_x[args.timesteps[j]])
+                            + self.gradient_kl_div(gradients_y[args.timesteps[i]], gradients_y[args.timesteps[j]]))
+                    )
+
 
             for i in range(len(args.timesteps)):
                 for j in range(i + 1, len(args.timesteps)):
-                    errors[(args.timesteps[i], args.timesteps[j])].append(
-                        0.5 * (gradient_kl_div(gradients_x[args.timesteps[i]], gradients_x(args.timesteps[j])) 
-                        + gradient_kl_div(gradients_y[args.timesteps[i]], gradients_y(args.timesteps[j]))
-                    )
+                    errors[(args.timesteps[i], args.timesteps[j])].append(np.mean(errors_local[(args.timesteps[i], args.timesteps[j])]))
+            
+            print("Step: ", step)
+        print(errors)
         return errors
 
     @torch.inference_mode()

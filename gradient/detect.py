@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument(
         "--num-training_samples",
         type=int,
-        default=1000,
+        default=300,
         help="The number of training samples to use from the dataset.",
     )
 
@@ -79,7 +79,7 @@ def parse_args():
     parser.add_argument(
         "--cache_dir",
         type=str,
-        default=None,
+        default="/fs/nexus-scratch/olkowski/datasets",
         help="The directory where the downloaded models and datasets will be stored.",
     )
     parser.add_argument(
@@ -266,7 +266,7 @@ def parse_args():
         type=str,
         default="reconstruction",
         help="the type of error to compute",
-        choices=["reconstruction", "noise_scale", "stepwise"]
+        choices=["reconstruction", "noise_scale", "stepwise", "grad"]
     )
 
     parser.add_argument(
@@ -330,15 +330,27 @@ def main(args):
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
     if args.dataset_name is not None:
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            split="train",
-        )
+        if args.dataset_name == "laion/dalle-3-dataset":
+             dataset = load_dataset(
+                     "laion/dalle-3-dataset",
+                     args.dataset_config_name,
+                     data_files=["data/train-00000-of-00026.parquet", "data/train-00004-of-00026.parquet","data/train-00006-of-00026.parquet", "data/train-00009-of-00026.parquet"],
+                     cache_dir=args.cache_dir, 
+                     split="train", 
+                     columns=["caption", "image", "link", "message_id", "timestamp"], 
+                     ignore_verifications=True
+            ) 
+        else:
+            dataset = load_dataset(
+                args.dataset_name,
+                args.dataset_config_name,
+                cache_dir=args.cache_dir,
+                split="train"
+            )
     else:
         dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
-
+    
+    print(dataset)
     dataset = dataset.select(range(args.num_training_samples))
 
     # Preprocessing the datasets and DataLoaders creation.
@@ -411,8 +423,12 @@ def main(args):
     elif args.error_type == "grad":
         errors = pipe.gradient_error(args, train_dataloader, text_embeddings)
         if args.logger == "wandb":
-            log_wandb_error_histogram(project="stablediffusion-detection", name=args.output_dir, args=args,
-                                      errors=errors)
+            for key in errors:
+                error = errors[key]
+                log_wandb_error_histogram(project="stablediffusion-detection",
+                                          name="{}-{}-{}".format(args.output_dir, key[0], key[1]), args=args,
+                                          errors=error)
+
     else:
         raise ValueError(f"Unknown error type: {args.error_type}")
 
