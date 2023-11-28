@@ -5,3 +5,6 @@ The other dataset (GAN generated): https://medium.com/generated-photos/press-aae
 
 The gradient is generated in NoiseScaleError&Gradient. 
 The KL comparison in grad_diff_KL
+
+
+Modifications on "gradients" are also considered ...  
