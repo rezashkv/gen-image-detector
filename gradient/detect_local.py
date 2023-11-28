@@ -14,7 +14,9 @@ from grad_metric import InvertibleStableDiffusionPipeline
 from diffusers import DPMSolverMultistepScheduler, DDIMScheduler
 from torchvision import transforms
 from diffusers.utils import is_tensorboard_available, is_wandb_available
-
+from torch.utils.data import Dataset
+import torch.utils.data as data_utils
+import natsort
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -327,31 +329,22 @@ def main(args):
     pipe.scheduler = scheduler
     pipe = pipe.to("cuda")
 
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        if args.dataset_name == "laion/dalle-3-dataset":
-             dataset = load_dataset(
-                     "laion/dalle-3-dataset",
-                     args.dataset_config_name,
-                     data_files=["data/train-00000-of-00041-88a791d8d175f015.parquet", "data/train-00000-of-00041-88a791d8d175f015.parquet","data/train-00000-of-00041-88a791d8d175f015.parquet", "data/train-00005-of-00041-8a571c96ff964217.parquet"],
-                     cache_dir=args.cache_dir, 
-                     split="train", 
-                     columns=["caption", "image", "link", "message_id", "timestamp"], 
-                     ignore_verifications=True
-            ) 
-        else:
-            dataset = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                cache_dir=args.cache_dir,
-                split="train"
-            )
-    else:
-        dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
-    
-    print(dataset)
-    dataset = dataset.select(range(args.num_training_samples))
+
+    class CustomDataSet(Dataset):
+        def __init__(self, main_dir, transform):
+            self.main_dir = main_dir
+            self.transform = transform
+            all_imgs = os.listdir(main_dir)
+            self.total_imgs = natsort.natsorted(all_imgs)
+
+        def __len__(self):
+            return len(self.total_imgs)
+
+        def __getitem__(self, idx):
+            img_loc = os.path.join(self.main_dir, self.total_imgs[idx])
+            image = Image.open(img_loc).convert("RGB")
+            tensor_image = self.transform(image)
+            return {'input': tensor_image}
 
     # Preprocessing the datasets and DataLoaders creation.
     transformations = transforms.Compose(
@@ -367,9 +360,13 @@ def main(args):
         images = [transformations(image.convert("RGB")) for image in examples["image"]]
         return {"input": images}
 
-    logging.info(f"Dataset size: {len(dataset)}")
+    #logging.info(f"Dataset size: {len(dataset)}")
 
-    dataset.set_transform(transform_images)
+    dataset = CustomDataSet(args.dataset_name, transformations)
+    indices = torch.arange(args.num_training_samples)
+    dataset = data_utils.Subset(dataset, indices)
+    
+    logging.info(f"Dataset size: {len(dataset)}")
 
     train_dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
@@ -407,7 +404,7 @@ def main(args):
             for key in errors:
                 error = errors[key]
                 log_wandb_error_histogram(project="stablediffusion-detection",
-                                          name="{}-{}".format(args.output_dir, key), args=args,
+                                          name="{}-{}".format(args.output_dir, key, key), args=args,
                                           errors=error)
 
     elif args.error_type == "reconstruction":
