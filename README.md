@@ -20,5 +20,5 @@ watermark_attacks:
 
 
 
-gradient: 
+* gradient: 
 This is code the team personally wrote. In this folder, we implement a new strategy using the technqiue of gradients. We attempt to train a classifier that can distguish between "real" and "fake" (image generated) using the idea of gradients. Specifically, we apply noise (in varying amounts/time steps) to each "real" and "fake" image and then denoise them. Then, we calculate the l2 norm of the difference between each pair of real and noised-denoised real image, and each pair of fake and noised-denoised fake image. A histogram of the l2 norms exists in the folder as well. 
