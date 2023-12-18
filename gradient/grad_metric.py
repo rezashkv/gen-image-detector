@@ -337,6 +337,16 @@ class InvertibleStableDiffusionPipeline(StableDiffusionPipeline):
         return recon_image
 
     @torch.inference_mode()
+    def reconstruct_image_step_t_2(self, image_latents, timestep, text_embeddings, noise):
+        timestep_t = torch.LongTensor([timestep]).to(image_latents.device)
+        noisy_latents = self.scheduler.add_noise(image_latents, noise, timesteps=timestep_t)
+        noise_pred = self.unet(noisy_latents, timestep_t, encoder_hidden_states=text_embeddings).sample
+        alpha_t = self.scheduler.alphas_cumprod[timestep]
+        reconstructed_latents = (noisy_latents - (1 - alpha_t) ** 0.5 * noise_pred) / (alpha_t ** 0.5)
+        reconstructed_image = self.decode_image(reconstructed_latents)
+        return reconstructed_image
+
+    @torch.inference_mode()
     def noise_scale_error_batches(self, args, dataloader, text_embeddings, dft=False):
         self.scheduler.set_timesteps(args.ddim_num_inference_steps)
 
@@ -487,7 +497,7 @@ class InvertibleStableDiffusionPipeline(StableDiffusionPipeline):
                     # compute the noise scale
                     noise = torch.randn(image_latents.shape).to(image_latents.device)
 
-                    reconstructed_img = self.reconstruct_image_step_t(image_latents, timestep, text_embeddings, noise)
+                    reconstructed_img = self.reconstruct_image_step_t_2(image_latents, timestep, text_embeddings, noise)
                  
                     # dx, dy are 1x3xHxW tensors
                     bins = [float(i) / 100 for i in range(-100, 101)]
@@ -513,6 +523,8 @@ class InvertibleStableDiffusionPipeline(StableDiffusionPipeline):
 
     @torch.inference_mode()
     def gradient_l2_error(self, args, dataloader, text_embeddings):
+        self.scheduler.set_timesteps(args.ddim_num_inference_steps)
+
         errors = {}
         for i in range(len(args.timesteps)):
             for j in range(i + 1, len(args.timesteps)):
@@ -541,13 +553,13 @@ class InvertibleStableDiffusionPipeline(StableDiffusionPipeline):
 
                 # dx, dy are 1x3xHxW tensors
                 dx, dy = self._compute_image_gradients(reconstructed_img)
-                grad_norm = 0.5 * (torch.norm(dx) + torch.norm(dy))
+                grad_norm = 0.5 * (torch.sum(dx ** 2, dim=(1, 2, 3)).item() + torch.sum(dy ** 2, dim=(1, 2, 3)).item())
                 errors_local[timestep] = grad_norm
 
 
             for i in range(len(args.timesteps)):
                 for j in range(i + 1, len(args.timesteps)):
-                    errors[(args.timesteps[i], args.timesteps[j])].append(errors_local[args.timesteps[i]].item() / errors_local[args.timesteps[j]].item())
+                    errors[(args.timesteps[i], args.timesteps[j])].append(errors_local[args.timesteps[i]] / errors_local[args.timesteps[j]])
 
             print("Step: ", step)
         print(errors)
@@ -557,6 +569,8 @@ class InvertibleStableDiffusionPipeline(StableDiffusionPipeline):
 
     @torch.inference_mode()
     def noise_scale_error_dft_binned(self, args, dataloader, text_embeddings, n_bins=12):
+        self.scheduler.set_timesteps(args.ddim_num_inference_steps)
+
         errors = {}
         for i in range(len(args.timesteps)):
             for j in range(i + 1, len(args.timesteps)):

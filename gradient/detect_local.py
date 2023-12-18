@@ -369,7 +369,7 @@ def main(args):
     logging.info(f"Dataset size: {len(dataset)}")
 
     train_dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
+        dataset, batch_size=args.train_batch_size, shuffle=False, num_workers=args.dataloader_num_workers
     )
 
     total_batch_size = args.train_batch_size * args.gradient_accumulation_steps
@@ -418,7 +418,7 @@ def main(args):
             log_wandb_error_histogram(project="stablediffusion-detection", name=args.output_dir, args=args,
                                       errors=errors)
     elif args.error_type == "grad":
-        errors = pipe.gradient_error(args, train_dataloader, text_embeddings)
+        errors = pipe.gradient_kl_error(args, train_dataloader, text_embeddings)
         if args.logger == "wandb":
             for key in errors:
                 error = errors[key]

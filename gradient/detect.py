@@ -334,7 +334,7 @@ def main(args):
              dataset = load_dataset(
                      "laion/dalle-3-dataset",
                      args.dataset_config_name,
-                     data_files=["data/train-00000-of-00041-88a791d8d175f015.parquet", "data/train-00000-of-00041-88a791d8d175f015.parquet","data/train-00000-of-00041-88a791d8d175f015.parquet", "data/train-00005-of-00041-8a571c96ff964217.parquet"],
+                     data_files=["data/train-00000-of-00046-0b86771d32a801d8.parquet", "data/train-00001-of-00046-b04c46128118a3e5.parquet","data/train-00002-of-00046-3feb140176526ef0.parquet"],
                      cache_dir=args.cache_dir, 
                      split="train", 
                      columns=["caption", "image", "link", "message_id", "timestamp"], 
@@ -372,7 +372,7 @@ def main(args):
     dataset.set_transform(transform_images)
 
     train_dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers
+        dataset, batch_size=args.train_batch_size, shuffle=False, num_workers=args.dataloader_num_workers
     )
 
     total_batch_size = args.train_batch_size * args.gradient_accumulation_steps
